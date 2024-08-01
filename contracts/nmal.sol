@@ -1,77 +1,78 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-contract NLGmal {
-    string constant NLGmal_chars = "0123456789mnopqrstuvwxyz";
-    uint8 constant base = 24;
+import "./NLGmal.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
-    function decimalToNlgmal(uint256 decimal) public pure returns (string memory) {
-        if (decimal == 0) {
-            return "0";
-        }
+contract AutomatedPrivateNLGWallet is ReentrancyGuard {
+    using ECDSA for bytes32;
 
-        bytes memory nlgmal = new bytes(78); // Max length for uint256
-        uint256 i = nlgmal.length;
-        while (decimal > 0) {
-            --i;
-            nlgmal[i] = bytes(NLGmal_chars)[decimal % base];
-            decimal /= base;
-        }
+    NLGmal private immutable nlgmal;
+    mapping(bytes32 => address) private nlgmalToAddress;
+    mapping(address => uint256) private balances;
+    mapping(address => uint256) private nonces;
 
-        bytes memory result = new bytes(nlgmal.length - i);
-        for (uint256 j = 0; j < result.length; j++) {
-            result[j] = nlgmal[i + j];
-        }
+    event AnonymousTransfer(bytes32 indexed commitmentHash);
 
-        return string(result);
+    constructor(address nlgmalAddress) {
+        nlgmal = NLGmal(nlgmalAddress);
     }
 
-    function nlgmalToDecimal(string memory nlgmal) public pure returns (uint256) {
-        bytes memory nlgmalBytes = bytes(nlgmal);
-        uint256 decimal = 0;
-
-        for (uint256 i = 0; i < nlgmalBytes.length; i++) {
-            uint8 charValue = uint8(charToValue(nlgmalBytes[i]));
-            decimal = decimal * base + charValue;
-        }
-
-        return decimal;
+    function registerNlgmalAddress() external {
+        string memory nlgmalAddress = nlgmal.addressToNlgmal(msg.sender);
+        bytes32 hashedNlgmal = keccak256(abi.encodePacked(nlgmalAddress));
+        nlgmalToAddress[hashedNlgmal] = msg.sender;
     }
 
-    function charToValue(bytes1 char) internal pure returns (uint8) {
-        if (char >= 0x30 && char <= 0x39) {
-            return uint8(char) - 0x30;
-        } else if (char >= 0x6D && char <= 0x7A) {
-            return uint8(char) - 0x6D + 10;
-        } else if (char >= 0x4D && char <= 0x5A) {
-            // Handle capital letters
-            return uint8(char) - 0x4D + 10;
-        } else {
-            revert("Invalid character");
-        }
+    function deposit() external payable {
+        balances[msg.sender] += msg.value;
     }
 
-    function bytesToNlgdecimal(bytes memory byteData) public pure returns (string memory) {
-        uint256 decimalNumber = bytesToUint256(byteData);
-        return decimalToNlgmal(decimalNumber);
+    function withdraw(uint256 amount) external nonReentrant {
+        require(balances[msg.sender] >= amount, "Insufficient balance");
+        balances[msg.sender] -= amount;
+        (bool success, ) = msg.sender.call{value: amount}("");
+        require(success, "Withdrawal failed");
     }
 
-    function nlgdecimalToBytes(string memory nlgdecimal) public pure returns (bytes memory) {
-        uint256 decimalNumber = nlgmalToDecimal(nlgdecimal);
-        return uint256ToBytes(decimalNumber);
+    function anonymousTransfer(
+        string memory recipientNlgmal,
+        uint256 amount,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external nonReentrant {
+        require(block.timestamp <= deadline, "Transaction expired");
+
+        bytes32 hashedRecipientNlgmal = keccak256(abi.encodePacked(recipientNlgmal));
+        address recipient = nlgmalToAddress[hashedRecipientNlgmal];
+        require(recipient != address(0), "Invalid recipient");
+
+        bytes32 messageHash = keccak256(abi.encodePacked(
+            "\x19Ethereum Signed Message:\n32",
+            keccak256(abi.encodePacked(recipientNlgmal, amount, nonces[msg.sender], deadline))
+        ));
+
+        address signer = ecrecover(messageHash, v, r, s);
+        require(signer == msg.sender, "Invalid signature");
+
+        require(balances[signer] >= amount, "Insufficient balance");
+
+        balances[signer] -= amount;
+        balances[recipient] += amount;
+        nonces[signer]++;
+
+        bytes32 commitmentHash = keccak256(abi.encodePacked(signer, recipient, amount, block.timestamp));
+        emit AnonymousTransfer(commitmentHash);
     }
 
-    function bytesToUint256(bytes memory _bytes) internal pure returns (uint256) {
-        require(_bytes.length <= 32, "bytesToUint256_outOfBounds");
-        uint256 result;
-        assembly {
-            result := mload(add(_bytes, 32))
-        }
-        return result;
+    function getNonce(address user) external view returns (uint256) {
+        return nonces[user];
     }
 
-    function uint256ToBytes(uint256 x) internal pure returns (bytes memory b) {
-        b = new bytes(32);
-        assembly { mstore(add(b, 32), x) }
+    receive() external payable {
+        balances[msg.sender] += msg.value;
     }
 }
